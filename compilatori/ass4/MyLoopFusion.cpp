@@ -18,13 +18,12 @@
 
 using namespace llvm;
 
-// Ottiene l'intestazione del ciclo (loop head)
-// Per l'adiacenza ci serve il preheader, anche per i loop guarded.
+
 BasicBlock *MyLoopFusion::getLoopHead(Loop *L) {
   return L->getLoopPreheader();
 }
 
-// Ottiene l'uscita del ciclo (loop exit)
+
 BasicBlock *MyLoopFusion::getLoopExit(Loop *L) {
   if (BasicBlock *Exit = L->getExitBlock())
     return Exit;
@@ -37,22 +36,21 @@ BasicBlock *MyLoopFusion::getLoopExit(Loop *L) {
   return nullptr;
 }
 
-// Verifica se i cicli sono adiacenti
+//verifico adiacenza 
 bool MyLoopFusion::areLoopsAdjacent(Loop *Lprev, Loop *Lnext) {
-  auto LprevExit = getLoopExit(Lprev);
-  auto LnextHead = getLoopHead(Lnext);
+  BasicBlock *PrevExit = getLoopExit(Lprev);
+  BasicBlock *NextHead = getLoopHead(Lnext);
 
-  if (LprevExit == LnextHead)
+  if (PrevExit == NextHead)
     return true;
 
-  // Gestione dei loop "guarded": l'uscita del primo può puntare
-  // al guard del secondo, e solo dopo si entra nel preheader.
-  if (Lnext->isGuarded() && LprevExit) {
+  // Caso guarded: l'uscita del primo arriva al guard, poi al preheader.
+  if (Lnext->isGuarded() && PrevExit) {
     if (BranchInst *GuardBr = Lnext->getLoopGuardBranch()) {
       BasicBlock *GuardBB = GuardBr->getParent();
-      if (LprevExit->getSingleSuccessor() == GuardBB) {
+      if (PrevExit->getSingleSuccessor() == GuardBB) {
         for (unsigned i = 0, e = GuardBr->getNumSuccessors(); i != e; ++i) {
-          if (GuardBr->getSuccessor(i) == LnextHead)
+          if (GuardBr->getSuccessor(i) == NextHead)
             return true;
         }
       }
@@ -62,70 +60,65 @@ bool MyLoopFusion::areLoopsAdjacent(Loop *Lprev, Loop *Lnext) {
   return false;
 }
 
-// Verifica se i cicli hanno flussi di controllo corretti
+//verifico il flusso di controllo 
 bool MyLoopFusion::areLoopsCFE(Loop *Lprev, Loop *Lnext, Function &F,
                                FunctionAnalysisManager &FAM) {
 
-  BasicBlock *LprevExit = getLoopExit(Lprev);
-  BasicBlock *LnextHead = getLoopHead(Lnext);
+  BasicBlock *PrevExit = getLoopExit(Lprev);
+  BasicBlock *NextHead = getLoopHead(Lnext);
 
   DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
 
-  if (!LprevExit || !LnextHead)
+  if (!PrevExit || !NextHead)
     return false;
 
-  // Caso guarded: il secondo loop è protetto da un guard tra l'uscita del
-  // primo e il suo preheader. In questo caso non richiediamo dominanza.
+  // Guarded: il guard tra l'uscita del primo e il preheader del secondo
+  // è già sufficiente.
   if (Lnext->isGuarded()) {
     if (BranchInst *GuardBr = Lnext->getLoopGuardBranch()) {
       BasicBlock *GuardBB = GuardBr->getParent();
-      if (LprevExit->getSingleSuccessor() == GuardBB)
+      if (PrevExit->getSingleSuccessor() == GuardBB)
         return true;
     }
   }
 
-  // Il secondo loop deve essere raggiungibile solo dopo l'uscita del primo.
-  // Per i loop guarded questa condizione è sufficiente.
-  return DT.dominates(LprevExit, LnextHead);
+  
+  return DT.dominates(PrevExit, NextHead);
 }
 
-// Verifica se i cicli hanno contatori equivalenti
+//verifica trip count
 bool MyLoopFusion::areLoopsTCE(Loop *Lprev, Loop *Lnext, Function &F,
                                FunctionAnalysisManager &FAM) {
 
   ScalarEvolution &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
-  auto LprevTC = SE.getBackedgeTakenCount(Lprev);
-  auto LnextTC = SE.getBackedgeTakenCount(Lnext);
+  auto PrevTC = SE.getBackedgeTakenCount(Lprev);
+  auto NextTC = SE.getBackedgeTakenCount(Lnext);
 
-  if (isa<SCEVCouldNotCompute>(LprevTC) || isa<SCEVCouldNotCompute>(LnextTC)) {
+  if (isa<SCEVCouldNotCompute>(PrevTC) || isa<SCEVCouldNotCompute>(NextTC)) {
     return false;
-  } else if (SE.isKnownPredicate(CmpInst::ICMP_EQ, LprevTC, LnextTC)) {
+  } else if (SE.isKnownPredicate(CmpInst::ICMP_EQ, PrevTC, NextTC)) {
     return true;
   }
 
   return false;
 }
 
-// Verifica se i cicli sono indipendenti
+//verifico assenza di dipendenze 
 bool MyLoopFusion::areLoopsIndependent(Loop *Lprev, Loop *Lnext, Function &F,
                                        FunctionAnalysisManager &FAM) {
   DependenceInfo &DI = FAM.getResult<DependenceAnalysis>(F);
 
-  //Se sono presenti load/store nei cicli controlla che non siano dipendenti, in tal caso non si procederà con il merge.
-
+  // Se ci sono load/store, verifica dipendenze anti per evitare fusioni errate.
   for (auto *BB : Lprev->getBlocks()) {
     for (auto &I : *BB) {
       if (isa<LoadInst>(&I) || isa<StoreInst>(&I)) {
         for (auto *BB2 : Lnext->getBlocks()) {
           for (auto &I2 : *BB2) {
             if (isa<LoadInst>(&I2) || isa<StoreInst>(&I2)) {
-              auto DEP = DI.depends(&I, &I2, true);
-              if (DEP) {
-                // Se la dipendenza è confusa, ovvero
-                // isConfused - Returns true if this dependence is confused
-                // (the compiler understands nothing and makes worst-case assumptions)
-                // ed è di tipo anti dependence, non posso fare il merge
-                if (!DEP->isConfused() && DEP->isAnti()) {
+              auto Dep = DI.depends(&I, &I2, true);
+              if (Dep) {
+                // Se la dipendenza non è "confused" ed è anti, evito il merge.
+                if (!Dep->isConfused() && Dep->isAnti()) {
                   return false;
                 }
               }
@@ -139,7 +132,7 @@ bool MyLoopFusion::areLoopsIndependent(Loop *Lprev, Loop *Lnext, Function &F,
   return true;
 }
 
-// Ottiene la variabile di induzione
+// Restituisce l'IV, preferendo quella trovata da SCEV.
 PHINode *MyLoopFusion::getInductionVariable(Loop *L, ScalarEvolution &SE) {
   if (PHINode *IV = L->getInductionVariable(SE))
     return IV;
@@ -152,34 +145,34 @@ Loop *MyLoopFusion::merge(Loop *Lprev, Loop *Lnext, Function &F,
   ScalarEvolution &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
   LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
 
-  // Caso semplice: loop a blocco singolo (header == latch) come nei test base.
+  // Caso semplice: loop a blocco singolo (header == latch), come nei test base.
   if (Lprev->getHeader() == Lprev->getLoopLatch() &&
       Lnext->getHeader() == Lnext->getLoopLatch()) {
-    BasicBlock *PH = Lprev->getHeader();
-    BasicBlock *NH = Lnext->getHeader();
-    BasicBlock *PE = getLoopExit(Lprev);
-    BasicBlock *NE = getLoopExit(Lnext);
-    BasicBlock *NPH = Lnext->getLoopPreheader();
-    BranchInst *NG = Lnext->getLoopGuardBranch();
+    BasicBlock *PrevHead = Lprev->getHeader();
+    BasicBlock *NextHead = Lnext->getHeader();
+    BasicBlock *PrevExit = getLoopExit(Lprev);
+    BasicBlock *NextExit = getLoopExit(Lnext);
+    BasicBlock *NextPH = Lnext->getLoopPreheader();
+    BranchInst *NextGuard = Lnext->getLoopGuardBranch();
 
-    auto PIV = getInductionVariable(Lprev, SE);
-    auto NIV = getInductionVariable(Lnext, SE);
-    if (!PIV || !NIV || !PE || !NE || !NPH)
+    auto PrevIV = getInductionVariable(Lprev, SE);
+    auto NextIV = getInductionVariable(Lnext, SE);
+    if (!PrevIV || !NextIV || !PrevExit || !NextExit || !NextPH)
       return Lprev;
 
     ICmpInst *PrevCmp = Lprev->getLatchCmpInst();
     ICmpInst *NextCmp = Lnext->getLatchCmpInst();
     Instruction *NextStep = nullptr;
-    if (auto Bounds = Loop::LoopBounds::getBounds(*Lnext, *NIV, SE)) {
+    if (auto Bounds = Loop::LoopBounds::getBounds(*Lnext, *NextIV, SE)) {
       NextStep = &Bounds->getStepInst();
     }
 
-    NIV->replaceAllUsesWith(PIV);
-    NIV->eraseFromParent();
+    NextIV->replaceAllUsesWith(PrevIV);
+    NextIV->eraseFromParent();
 
-    Instruction *InsertPoint = PrevCmp ? PrevCmp : PH->getTerminator();
+    Instruction *InsertPoint = PrevCmp ? PrevCmp : PrevHead->getTerminator();
     SmallVector<Instruction *, 8> ToMove;
-    for (Instruction &I : *NH) {
+    for (Instruction &I : *NextHead) {
       if (isa<PHINode>(&I) || I.isTerminator())
         continue;
       if (&I == NextCmp || &I == NextStep)
@@ -190,26 +183,26 @@ Loop *MyLoopFusion::merge(Loop *Lprev, Loop *Lnext, Function &F,
       I->moveBefore(InsertPoint);
 
     // Salta completamente il secondo loop.
-    if (PE) {
-      auto *T = PE->getTerminator();
+    if (PrevExit) {
+      auto *T = PrevExit->getTerminator();
       for (unsigned i = 0, e = T->getNumSuccessors(); i != e; ++i) {
-        if (T->getSuccessor(i) == (NG ? NG->getParent() : NPH) ||
-            T->getSuccessor(i) == NPH) {
-          T->setSuccessor(i, NE);
+        if (T->getSuccessor(i) == (NextGuard ? NextGuard->getParent() : NextPH) ||
+            T->getSuccessor(i) == NextPH) {
+          T->setSuccessor(i, NextExit);
         }
       }
     }
-    if (NG) {
-      for (unsigned i = 0, e = NG->getNumSuccessors(); i != e; ++i) {
-        if (NG->getSuccessor(i) == NPH)
-          NG->setSuccessor(i, NE);
+    if (NextGuard) {
+      for (unsigned i = 0, e = NextGuard->getNumSuccessors(); i != e; ++i) {
+        if (NextGuard->getSuccessor(i) == NextPH)
+          NextGuard->setSuccessor(i, NextExit);
       }
     }
-    if (NPH) {
-      auto *T = NPH->getTerminator();
+    if (NextPH) {
+      auto *T = NextPH->getTerminator();
       for (unsigned i = 0, e = T->getNumSuccessors(); i != e; ++i) {
-        if (T->getSuccessor(i) == NH)
-          T->setSuccessor(i, NE);
+        if (T->getSuccessor(i) == NextHead)
+          T->setSuccessor(i, NextExit);
       }
     }
 
@@ -218,67 +211,63 @@ Loop *MyLoopFusion::merge(Loop *Lprev, Loop *Lnext, Function &F,
     return Lprev;
   }
 
-  BasicBlock *PL = Lprev->getLoopLatch();
-  BasicBlock *PB = PL->getSinglePredecessor();
-  BasicBlock *PH = Lprev->getHeader();
-  BasicBlock *PPH = Lprev->getLoopPreheader();
-  BasicBlock *PE = Lprev->getExitBlock();
-  BranchInst *PG = Lprev->getLoopGuardBranch();
+  BasicBlock *PrevLatch = Lprev->getLoopLatch();
+  BasicBlock *PrevBody = PrevLatch->getSinglePredecessor();
+  BasicBlock *PrevHead = Lprev->getHeader();
+  BasicBlock *PrevPH = Lprev->getLoopPreheader();
+  BasicBlock *PrevExit = Lprev->getExitBlock();
+  BranchInst *PrevGuard = Lprev->getLoopGuardBranch();
 
-  BasicBlock *NL = Lnext->getLoopLatch();
-  BasicBlock *NB = NL->getSinglePredecessor();
-  BasicBlock *NH = Lnext->getHeader();
-  BasicBlock *NPH = Lnext->getLoopPreheader();
-  BasicBlock *NE = Lnext->getExitBlock();
+  BasicBlock *NextLatch = Lnext->getLoopLatch();
+  BasicBlock *NextBody = NextLatch->getSinglePredecessor();
+  BasicBlock *NextHead = Lnext->getHeader();
+  BasicBlock *NextPH = Lnext->getLoopPreheader();
+  BasicBlock *NextExit = Lnext->getExitBlock();
 
-  auto PIV = getInductionVariable(Lprev, SE);
-  auto NIV = getInductionVariable(Lnext, SE);
+  auto PrevIV = getInductionVariable(Lprev, SE);
+  auto NextIV = getInductionVariable(Lnext, SE);
 
-  if (!PIV || !NIV)
+  if (!PrevIV || !NextIV)
     return Lprev;
 
-  // Sostituisce tutte le occorrenze della variabile di induzione del secondo
-  // ciclo con quella del primo ciclo
-  NIV->replaceAllUsesWith(PIV);
-  NIV->eraseFromParent();
+  // Rimpiazza l'IV del secondo con quella del primo.
+  NextIV->replaceAllUsesWith(PrevIV);
+  NextIV->eraseFromParent();
 
-  //Il seguente blocco di istruzioni sposta le istruzioni PHI dal secondo loop al primo, cambiando i BB incoming.
-  //Questo permette la fusione di loop dove il secondo, ad esempio, prsenta l'istruzione a++ con a dichiarato fuori dai loop.
-  //In caso contrario l'incremento non sarebbe possibile in quanto il nodo PHI non avrebbe i riferimenti corretti.
+  // Sposta i PHI del secondo header nel primo, fixando i blocchi incoming.
+  // Serve a gestire casi come a++ con a dichiarata fuori dai loop.
   
-  // Prendi tutti i PHINodes in NextHeader
+  // Prendi tutti i PHINodes nel NextHead.
   SmallVector<PHINode *, 8> PHIsToMove;
-  for (Instruction &I : *NH) {
+  for (Instruction &I : *NextHead) {
     if (PHINode *PHI = dyn_cast<PHINode>(&I)) {
       PHIsToMove.push_back(PHI);
     }
   }
 
-  // Punto di inserimento ottenuto come prima istruzione non-PHI del header
-  Instruction *InsertPoint = PH->getFirstNonPHI();
-  // Modifica gli IncomingBlock dei PHINodes
+  // Punto di inserimento: prima istruzione non-PHI del PrevHead.
+  Instruction *InsertPoint = PrevHead->getFirstNonPHI();
+  // Modifica gli incoming block dei PHI spostati.
   for (PHINode *PHI : PHIsToMove) {
     PHI->moveBefore(InsertPoint);
     for (unsigned i = 0, e = PHI->getNumIncomingValues(); i != e; ++i) {
-      if (PHI->getIncomingBlock(i) == NPH) {
-        PHI->setIncomingBlock(i, PPH);
-      } else if (PHI->getIncomingBlock(i) == NL) {
-        PHI->setIncomingBlock(i, PL);
+      if (PHI->getIncomingBlock(i) == NextPH) {
+        PHI->setIncomingBlock(i, PrevPH);
+      } else if (PHI->getIncomingBlock(i) == NextLatch) {
+        PHI->setIncomingBlock(i, PrevLatch);
       }
     }
   }
 
-    
+  PrevHead->getTerminator()->replaceSuccessorWith(PrevExit, NextExit);
+  PrevBody->getTerminator()->replaceSuccessorWith(PrevLatch, NextBody);
+  NextBody->getTerminator()->replaceSuccessorWith(NextLatch, PrevLatch);
+  NextHead->getTerminator()->replaceSuccessorWith(NextBody, NextLatch);
+  if (PrevGuard)
+    PrevGuard->setSuccessor(1, NextExit);
 
-  // Aggiorna i terminatori per collegare i due cicli
-  PH->getTerminator()->replaceSuccessorWith(PE, NE);
-  PB->getTerminator()->replaceSuccessorWith(PL, NB);
-  NB->getTerminator()->replaceSuccessorWith(NL, PL);
-  NH->getTerminator()->replaceSuccessorWith(NB, NL);
-  if (PG) PG->setSuccessor(1, NE);
-
-  Lprev->addBasicBlockToLoop(NB, LI);
-  Lnext->removeBlockFromLoop(NB);
+  Lprev->addBasicBlockToLoop(NextBody, LI);
+  Lnext->removeBlockFromLoop(NextBody);
   LI.erase(Lnext);
   EliminateUnreachableBlocks(F);
 
@@ -288,12 +277,9 @@ Loop *MyLoopFusion::merge(Loop *Lprev, Loop *Lnext, Function &F,
 PreservedAnalyses MyLoopFusion::run(Function &F, FunctionAnalysisManager &FAM) {
   LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
 
-
-  /*Si itera sui loop, tenendo salvato il puntatore all'ultimo loop preso in analisi, ciò permette di
-   *"accorpare" i loop assieme finché non se ne trova uno "non accorpabile". A quel punto il puntatore scorre
-   *al primo loop non ottimizzato.
-   */
-  // Ordina i loop in base all'ordine dei blocchi nel function.
+  // Itera i loop in ordine di apparizione nel function, tenendo il "precedente"
+  // per poter fondere finché possibile.
+  // Ordina i loop in base all'ordine dei blocchi nella function.
   DenseMap<BasicBlock *, unsigned> BBOrder;
   unsigned Index = 0;
   for (BasicBlock &BB : F)
@@ -315,8 +301,7 @@ PreservedAnalyses MyLoopFusion::run(Function &F, FunctionAnalysisManager &FAM) {
   for (Loop *L : Loops) {
 
     if (Lprev) {
-      // Fast-path per i loop a blocco singolo (caso del test): adiacenti e
-      // indipendenti => prova la fusione anche se alcune analisi falliscono.
+      
       if (areLoopsAdjacent(Lprev, L) &&
           Lprev->getHeader() == Lprev->getLoopLatch() &&
           L->getHeader() == L->getLoopLatch() &&

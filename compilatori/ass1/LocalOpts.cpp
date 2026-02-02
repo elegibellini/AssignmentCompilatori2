@@ -1,16 +1,3 @@
-//===-- LocalOpts.cpp ----------------------------------------------------===//
-//
-// Questo file va inserito in llvm/lib/Transforms/Utils
-// E aggiunto dentro al file llvm/lib/Transforms/Utils/CMakeLists.txt
-//
-// Poi aggiungere il passo MODULE_PASS("localopts", LocalOpts()) 
-// in llvm/lib/Passes/PassRegistry.def
-//
-// Ricordarsi di guardare LocalOpts.h e aggiungere anche quel file
-//
-//===----------------------------------------------------------------------===//
-
-
 #include "llvm/Transforms/Utils/LocalOpts.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/InstrTypes.h"
